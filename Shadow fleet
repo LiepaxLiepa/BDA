@@ -1,0 +1,562 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import os
+import shutil
+import time
+import zlib
+
+from collections import defaultdict
+from multiprocessing import Pool
+from pathlib import Path
+from typing import Dict, List, Tuple, Iterable, Optional
+from datetime import datetime
+
+import psutil
+
+
+# =========================
+# CONFIG
+# =========================
+
+INVALID_MMSI = {
+    "000000000",
+    "111111111",
+    "123456789",
+    "999999999",
+}
+MIN_VALID_MMSI = 100000000
+MAX_VALID_MMSI = 999999999
+
+GOING_DARK_HOURS = 4.0
+LOITER_DISTANCE_METERS = 500.0
+LOITER_MAX_SOG = 1.0
+LOITER_TIME = 2.0
+DRAFT_BLACKOUT_HOURS = 2.0
+DEPTH_IN_WATER = 0.05
+IMPOSSIBLE_SPEED_KNOTS = 60.0
+
+
+# =========================
+# FIXES
+# =========================
+
+def fix_mb(value: int) -> float:
+    return value / (1024 * 1024)
+
+#fix so that code does not get stuck on not floats or n/as
+def safe_float(x, default=None):
+    try:
+        if x is None or x == "":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+#convert a timestamp string from the CSV into a datetime object
+def parse_timestamp(text):
+    try:
+        return datetime.strptime(text.strip(), "%d/%m/%Y %H:%M:%S")
+    except:
+        return None
+
+
+def is_valid_mmsi(mmsi: str) -> bool:
+    if not mmsi:
+        return False
+    mmsi = str(mmsi).strip()
+    if mmsi in INVALID_MMSI:
+        return False
+    if len(mmsi) != 9 or not mmsi.isdigit():
+        return False
+    val = int(mmsi)
+    return MIN_VALID_MMSI <= val <= MAX_VALID_MMSI
+
+#calculates the distance between two geographic coordinates
+def distance(lat1, lon1, lat2, lon2):
+    r = 6371000.0 #average radius in meters
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a)) #convert into meters
+
+#convert meters to nautical miles
+def meters_to_nm(meters):
+    return meters / 1852.0
+
+#calculates how many hours passed between two timestamps
+def hours_between(t1, t2):
+    return abs((t2 - t1).total_seconds()) / 3600.0
+
+#decides which worker a piece of data should go to during parallel processing
+#ensures that same MMSI → always same worker
+def worker(key, n):
+    return zlib.crc32(str(key).encode("utf-8")) % n
+
+#redefine the header names for some columns into shorter ones
+def build_header_map(fieldnames):
+    return {
+        "mmsi": "MMSI",
+        "ts": "Timestamp",
+        "lat": "Latitude",
+        "lon": "Longitude",
+        "draught": "Draught",
+        "sog": "SOG"
+    }
+
+
+def dfsi_score(max_gap_hours, total_impossible_jump_nm, c_count):
+    return (max_gap_hours / 2.0) + (total_impossible_jump_nm / 10.0) + (c_count * 15.0)
+
+
+#loops through both files and returns the total number of rows.
+def count_rows(input_files: List[Path]) -> int:
+    total = 0
+    for path in input_files:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            total += sum(1 for _ in f) - 1 #counts every line in the file exept the header
+    return total
+
+
+# =========================
+# Task 1: Low-Memory Parallel Partitioning
+    #1) cleans bad rows
+    #2) sends each valid row into a smaller partition file
+    #3) makes sure the same vessel always goes to the same bucket
+    #4) creates a second set of partition files for loitering detection
+# =========================
+
+def partition_files(input_csv_files: List[Path], workdir: Path, n_buckets: int, progress_chunk: int) -> Tuple[int, int, int]:
+    #create the folder structure where tge partitioned AIS data will be stored
+    os.makedirs(workdir, exist_ok=True)
+    part_dir = workdir / "parts"
+    loiter_dir = workdir / "loiter"
+    part_dir.mkdir(parents=True, exist_ok=True)
+    loiter_dir.mkdir(parents=True, exist_ok=True)
+
+    normalized_header = ["mmsi", "ts", "lat", "lon", "sog", "draught"]
+
+    part_files = []  #used for vessel-base anomalies (going dark, draft changes, identity cloning)
+    loiter_files = [] #used for loiter anomaly
+    part_writers = []
+    loiter_writers = []
+
+#creates 4 files for part anomomalies and loiter anomalies
+    for i in range(n_buckets):
+        pf = open(part_dir / f"part_{i}.csv", "w", newline="", encoding="utf-8")
+        lf = open(loiter_dir / f"loiter_{i}.csv", "w", newline="", encoding="utf-8")
+        pw = csv.writer(pf)
+        lw = csv.writer(lf)
+        pw.writerow(normalized_header)
+        lw.writerow(normalized_header)
+        part_files.append(pf)
+        loiter_files.append(lf)
+        part_writers.append(pw)
+        loiter_writers.append(lw)
+
+    rows_seen = 0
+    rows_kept = 0
+    dirty_rows = 0
+
+    for input_csv in input_csv_files:
+        print(f"[partition] reading {input_csv.name}")
+
+        with input_csv.open("r", newline="", encoding="utf-8", errors="replace") as f:
+            reader = csv.DictReader(f)
+            header_map = build_header_map(reader.fieldnames or [])
+
+            required = ["mmsi", "ts", "lat", "lon"]
+            missing = [x for x in required if header_map.get(x) is None]
+            if missing:
+                raise ValueError(f"Missing columns {missing} in file {input_csv}")
+
+            for row in reader:
+                rows_seen += 1
+
+                mmsi = str(row.get(header_map["mmsi"], "")).strip()
+                ts = parse_timestamp(row.get(header_map["ts"]))
+                lat = safe_float(row.get(header_map["lat"]))
+                lon = safe_float(row.get(header_map["lon"]))
+                sog = safe_float(row.get(header_map["sog"]), default=0.0)
+                draught = safe_float(row.get(header_map["draught"]), default=None)
+
+                if not is_valid_mmsi(mmsi):
+                    dirty_rows += 1
+                    continue
+                if ts is None or lat is None or lon is None:
+                    dirty_rows += 1
+                    continue
+                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                    dirty_rows += 1
+                    continue
+
+                if sog is None or sog < 0 or sog > 100:
+                    sog = 0.0
+                if draught is not None and draught < 0:
+                    draught = None
+
+                norm = [mmsi, ts.isoformat(sep=" "), lat, lon, sog, draught]
+
+                b = worker(mmsi, n_buckets)
+                part_writers[b].writerow(norm)
+                rows_kept += 1
+
+                if sog <= LOITER_MAX_SOG:
+                    hour_key = ts.strftime("%Y-%m-%d %H")
+                    lb = worker(hour_key, n_buckets)
+                    loiter_writers[lb].writerow(norm)
+
+                if rows_seen % progress_chunk == 0:
+                    print(f"[partition] rows_seen={rows_seen:,} rows_kept={rows_kept:,} dirty={dirty_rows:,}")
+
+    for f in part_files + loiter_files:
+        f.close()
+
+    return rows_seen, rows_kept, dirty_rows
+
+
+# =========================
+# WORKER TASKS
+# =========================
+
+def process_main_partition(task: Tuple[int, str]) -> Tuple[int, float, Dict[str, dict]]:
+    chunk_index, path = task
+    start_time = time.perf_counter()
+
+    vessels = defaultdict(list)
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ts = parse_timestamp(row["ts"])
+            if ts is None:
+                continue
+
+            lat = safe_float(row["lat"])
+            lon = safe_float(row["lon"])
+            sog = safe_float(row["sog"], default=0.0)
+            draught = safe_float(row["draught"], default=None)
+            mmsi = row["mmsi"]
+
+            if lat is None or lon is None:
+                continue
+
+            vessels[mmsi].append((ts, lat, lon, sog, draught))
+
+    results = {}
+
+    for mmsi, pts in vessels.items():
+        if len(pts) < 2:
+            continue
+
+        pts.sort(key=lambda x: x[0])
+
+        a_count = 0
+        c_count = 0
+        d_count = 0
+        max_gap_hours = 0.0
+        total_impossible_jump_nm = 0.0
+        first_flag_coord = None
+
+        for i in range(1, len(pts)):
+            t1, lat1, lon1, sog1, dr1 = pts[i - 1]
+            t2, lat2, lon2, sog2, dr2 = pts[i]
+
+            gap_h = hours_between(t1, t2)
+            dist_m = distance(lat1, lon1, lat2, lon2)
+            dist_nm = meters_to_nm(dist_m)
+
+            if gap_h > GOING_DARK_HOURS:
+                implied_speed = dist_nm / gap_h if gap_h > 0 else 0.0
+                if implied_speed > 1.0:
+                    a_count += 1
+                    max_gap_hours = max(max_gap_hours, gap_h)
+                    if first_flag_coord is None:
+                        first_flag_coord = (lat2, lon2)
+
+            if gap_h > DRAFT_BLACKOUT_HOURS and dr1 is not None and dr2 is not None and dr1 > 0:
+                change_pct = abs(dr2 - dr1) / dr1
+                if change_pct > 0.05:
+                    c_count += 1
+                    if first_flag_coord is None:
+                        first_flag_coord = (lat2, lon2)
+
+            if gap_h > 0:
+                implied_speed = dist_nm / gap_h
+                if implied_speed > IMPOSSIBLE_SPEED_KNOTS:
+                    d_count += 1
+                    total_impossible_jump_nm += dist_nm
+                    if first_flag_coord is None:
+                        first_flag_coord = (lat2, lon2)
+
+        results[mmsi] = {
+            "A": a_count,
+            "B": 0,
+            "C": c_count,
+            "D": d_count,
+            "max_gap_hours": max_gap_hours,
+            "total_impossible_jump_nm": total_impossible_jump_nm,
+            "flag_lat": first_flag_coord[0] if first_flag_coord else None,
+            "flag_lon": first_flag_coord[1] if first_flag_coord else None,
+        }
+
+    elapsed_time = time.perf_counter() - start_time
+    return chunk_index, elapsed_time, results
+
+
+def process_loiter_partition(task: Tuple[int, str]) -> Tuple[int, float, Dict[str, int]]:
+    chunk_index, path = task
+    start_time = time.perf_counter()
+
+    by_hour = defaultdict(list)
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ts = parse_timestamp(row["ts"])
+            if ts is None:
+                continue
+
+            mmsi = row["mmsi"]
+            lat = safe_float(row["lat"])
+            lon = safe_float(row["lon"])
+            sog = safe_float(row["sog"], default=0.0)
+
+            if lat is None or lon is None:
+                continue
+            if sog > LOITER_MAX_SOG:
+                continue
+
+            hour_key = ts.strftime("%Y-%m-%d %H")
+            by_hour[hour_key].append((mmsi, lat, lon))
+
+    pair_hours = defaultdict(set)
+
+    for hour_key, rows in by_hour.items():
+        first_point = {}
+        for mmsi, lat, lon in rows:
+            if mmsi not in first_point:
+                first_point[mmsi] = (lat, lon)
+
+        ships = list(first_point.items())
+        n = len(ships)
+
+        for i in range(n):
+            m1, (lat1, lon1) = ships[i]
+            for j in range(i + 1, n):
+                m2, (lat2, lon2) = ships[j]
+                if m1 == m2:
+                    continue
+
+                dist = distance(lat1, lon1, lat2, lon2)
+                if dist <= LOITER_DISTANCE_METERS:
+                    pair = tuple(sorted((m1, m2)))
+                    pair_hours[pair].add(hour_key)
+
+    vessel_b_counts = defaultdict(int)
+
+    for pair, hours_set in pair_hours.items():
+        if len(hours_set) >= 3:
+            m1, m2 = pair
+            vessel_b_counts[m1] += 1
+            vessel_b_counts[m2] += 1
+
+    elapsed_time = time.perf_counter() - start_time
+    return chunk_index, elapsed_time, dict(vessel_b_counts)
+
+
+# =========================
+# MERGE
+# =========================
+
+def merge_results(main_results_list, loiter_results_list):
+    merged = defaultdict(lambda: {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+        "D": 0,
+        "max_gap_hours": 0.0,
+        "total_impossible_jump_nm": 0.0,
+        "flag_lat": None,
+        "flag_lon": None,
+    })
+
+    for result_dict in main_results_list:
+        for mmsi, data in result_dict.items():
+            merged[mmsi]["A"] += data["A"]
+            merged[mmsi]["C"] += data["C"]
+            merged[mmsi]["D"] += data["D"]
+            merged[mmsi]["max_gap_hours"] = max(merged[mmsi]["max_gap_hours"], data["max_gap_hours"])
+            merged[mmsi]["total_impossible_jump_nm"] += data["total_impossible_jump_nm"]
+
+            if merged[mmsi]["flag_lat"] is None and data["flag_lat"] is not None:
+                merged[mmsi]["flag_lat"] = data["flag_lat"]
+                merged[mmsi]["flag_lon"] = data["flag_lon"]
+
+    for loiter_dict in loiter_results_list:
+        for mmsi, b_count in loiter_dict.items():
+            merged[mmsi]["B"] += b_count
+
+    final_rows = []
+    for mmsi, d in merged.items():
+        score = dfsi_score(d["max_gap_hours"], d["total_impossible_jump_nm"], d["C"])
+        final_rows.append({
+            "mmsi": mmsi,
+            "A_going_dark": d["A"],
+            "B_loiter_transfer": d["B"],
+            "C_draft_change": d["C"],
+            "D_cloning": d["D"],
+            "max_gap_hours": round(d["max_gap_hours"], 3),
+            "total_impossible_jump_nm": round(d["total_impossible_jump_nm"], 3),
+            "DFSI": round(score, 3),
+            "flag_lat": d["flag_lat"],
+            "flag_lon": d["flag_lon"],
+        })
+
+    final_rows.sort(key=lambda x: (-x["DFSI"], -x["C_draft_change"], -x["D_cloning"]))
+    return final_rows
+
+
+def write_results_csv(rows, output_file: Path):
+    with output_file.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(
+            csvfile,
+            fieldnames=[
+                "mmsi",
+                "A_going_dark",
+                "B_loiter_transfer",
+                "C_draft_change",
+                "D_cloning",
+                "max_gap_hours",
+                "total_impossible_jump_nm",
+                "DFSI",
+                "flag_lat",
+                "flag_lon",
+            ]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# =========================
+# MAIN PIPELINE
+# =========================
+
+def run_pipeline(input_files: List[Path], output_file: Path, workdir: Path, workers: int, chunk_size: int, keep_temp: bool):
+    start = time.perf_counter()
+    process = psutil.Process()
+
+    if workdir.exists():
+        shutil.rmtree(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    total_rows: Optional[int] = count_rows(input_files)
+    print(f"Total input rows: {total_rows:,}")
+
+    rows_seen, rows_kept, dirty_rows = partition_files(
+        input_csv_files=input_files,
+        workdir=workdir,
+        n_buckets=workers,
+        progress_chunk=chunk_size
+    )
+
+    print(f"\nPartition done")
+    print(f"Rows seen:  {rows_seen:,}")
+    print(f"Rows kept:  {rows_kept:,}")
+    print(f"Dirty rows: {dirty_rows:,}")
+    print(f"Memory RSS after partition: {fix_mb(process.memory_info().rss):.2f} MB")
+
+    part_files = sorted((workdir / "parts").glob("part_*.csv"))
+    loiter_files = sorted((workdir / "loiter").glob("loiter_*.csv"))
+
+    main_tasks = [(i + 1, str(path)) for i, path in enumerate(part_files)]
+    loiter_tasks = [(i + 1, str(path)) for i, path in enumerate(loiter_files)]
+
+    main_results_list = []
+    loiter_results_list = []
+
+    completed_chunks = 0
+    total_chunks = len(main_tasks) + len(loiter_tasks)
+
+    with Pool(processes=workers) as pool:
+        for chunk_index, chunk_time, partial in pool.imap_unordered(process_main_partition, main_tasks, chunksize=1):
+            main_results_list.append(partial)
+            completed_chunks += 1
+            mem_rss = process.memory_info().rss
+            print(
+                f"[main] chunk {chunk_index} processed in {chunk_time:.4f} s | "
+                f"progress {completed_chunks}/{total_chunks} | "
+                f"memory RSS {fix_mb(mem_rss):.2f} MB"
+            )
+
+    with Pool(processes=workers) as pool:
+        for chunk_index, chunk_time, partial in pool.imap_unordered(process_loiter_partition, loiter_tasks, chunksize=1):
+            loiter_results_list.append(partial)
+            completed_chunks += 1
+            mem_rss = process.memory_info().rss
+            print(
+                f"[loiter] chunk {chunk_index} processed in {chunk_time:.4f} s | "
+                f"progress {completed_chunks}/{total_chunks} | "
+                f"memory RSS {fix_mb(mem_rss):.2f} MB"
+            )
+
+    final_rows = merge_results(main_results_list, loiter_results_list)
+    write_results_csv(final_rows, output_file)
+
+    total_time = time.perf_counter() - start
+    final_mem_rss = process.memory_info().rss
+
+    print(f"\nResults written to: {output_file.name}")
+    print(f"Flagged vessels: {len(final_rows)}")
+    print(f"Total time: {total_time:.2f} seconds")
+    print(f"Final memory RSS: {fix_mb(final_mem_rss):.2f} MB")
+
+    print("\nTop 5 vessels by DFSI:")
+    for row in final_rows[:5]:
+        print(row)
+
+    if not keep_temp:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# =========================
+# CLI
+# =========================
+
+def main():
+    parser = argparse.ArgumentParser(description="Shadow Fleet detection for two AIS days")
+    parser.add_argument(
+        "--inputs",
+        nargs="+",
+        required=True,
+        help="Example: aisdk-2025-05-02.csv aisdk-2025-05-03.csv"
+    )
+    parser.add_argument("--output", default="shadow_fleet_results.csv")
+    parser.add_argument("--workdir", default="shadow_work")
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--chunk-size", type=int, default=100000)
+    parser.add_argument("--keep-temp", action="store_true")
+
+    args = parser.parse_args()
+
+    input_files = [Path(x) for x in args.inputs]
+    output_file = Path(args.output)
+    workdir = Path(args.workdir)
+
+    run_pipeline(
+        input_files=input_files,
+        output_file=output_file,
+        workdir=workdir,
+        workers=args.workers,
+        chunk_size=args.chunk_size,
+        keep_temp=args.keep_temp,
+    )
+
+
+if __name__ == "__main__":
+    main()
