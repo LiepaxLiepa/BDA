@@ -105,7 +105,7 @@ def worker(key, n):
 def build_header_map(fieldnames):
     return {
         "mmsi": "MMSI",
-        "ts": "Timestamp",
+        "ts": "# Timestamp",
         "lat": "Latitude",
         "lon": "Longitude",
         "draught": "Draught",
