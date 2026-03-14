@@ -367,6 +367,10 @@ def process_loiter_partition(task: Tuple[int, str]) -> Tuple[int, float, Dict[st
             vessel_b_counts[m1] += 1
             vessel_b_counts[m2] += 1
 
+#Man atrodo čia tas viršutinis negerai, nes jis tiesiog skaičiuoja kad būtų daugiau nei 3 valandos kai tie patys laivai atsiduria šalia.
+#Pagal task'ą turi būti 2 val. ir neesu tikra ar tikrai, bet buvau supratus kad tos 2 val.turi būt nepertraukiamos (na kad pvz. 05.02 dieną jie ir 10 ir 11 val. jie buvo kartu)
+#O dabar skaičiuotume ir tada kai pvz. 05.02 10 val. buvp kartu ir 05.03 dieną 14 val. buvo kartu
+
     elapsed_time = time.perf_counter() - start_time
     return chunk_index, elapsed_time, dict(vessel_b_counts)
 
