@@ -61,7 +61,13 @@ def safe_float(x, default=None):
 #convert a timestamp string from the CSV into a datetime object
 def parse_timestamp(text):
     try:
-        return datetime.strptime(text.strip(), "%d/%m/%Y %H:%M:%S")
+        text = text.strip()
+        # Try ISO format first (from partitioned files)
+        try:
+            return datetime.fromisoformat(text)
+        except:
+            # Fall back to original format (from raw CSV)
+            return datetime.strptime(text, "%d/%m/%Y %H:%M:%S")
     except:
         return None
 
