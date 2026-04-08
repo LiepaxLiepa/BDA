@@ -7,8 +7,6 @@ This project processes AIS CSV files and produces:
 - `anomaly_list.csv` for vessel-level anomaly summaries
 - `memory_usage_per_worker.png` for RAM usage during the run
 
-The main script is [process_ais_csv.py](/Users/ziviletareilyte/Documents/naujas_test/Pagrindinis/2026-pirma-uzduotis/process_ais_csv.py).
-
 ## What The Script Detects
 
 The pipeline analyzes AIS records and looks for these behaviors:
