@@ -50,9 +50,8 @@ The script expects AIS CSV files with columns matching the Danish AIS export lay
 
 Example files in this project:
 
-- [aisdk-2025-05-02.csv](/Users/ziviletareilyte/Documents/naujas_test/Pagrindinis/2026-pirma-uzduotis/aisdk-2025-05-02.csv)
-- [aisdk-2025-05-03.csv](/Users/ziviletareilyte/Documents/naujas_test/Pagrindinis/2026-pirma-uzduotis/aisdk-2025-05-03.csv)
-
+- [aisdk-2025-05-02.csv]
+- [aisdk-2025-05-03.csv]
 ## Requirements
 
 Use Python 3 and install these libraries:
