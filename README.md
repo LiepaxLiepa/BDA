@@ -1,4 +1,4 @@
-# BDA
+# Assignment 1
 # AIS CSV Processing
 
 This project processes AIS CSV files and produces:
