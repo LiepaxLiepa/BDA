@@ -7,21 +7,6 @@ This project processes AIS CSV files and produces:
 - `anomaly_list.csv` for vessel-level anomaly summaries
 - `memory_usage_per_worker.png` for RAM usage during the run
 
-## What The Script Detects
-
-The pipeline analyzes AIS records and looks for these behaviors:
-
-- `Loitering`: two slow vessels remain within 500 meters for at least 2 hours
-- `Going dark`: a vessel disappears for more than 4 hours and reappears over 500 meters away
-- `Draught change`: draught changes by more than 5% after a gap longer than 2 hours
-- `Impossible speed`: inferred speed between consecutive valid points exceeds 60 knots
-
-The anomaly summary also computes a `dfsi` score:
-
-```text
-dfsi = (max_gap_hours / 2.0) + (total_impossible_distance_nm / 10.0) + (draught_change_count * 15.0)
-```
-
 ## Input Rules
 
 Before rows are processed, the script applies broad validation rules. A row is skipped if:
@@ -113,16 +98,6 @@ Shows memory usage over time for:
 - main process
 - pair worker
 - anomaly worker
-
-## Runtime Behavior
-
-The script uses multiprocessing:
-
-- one worker for pair and loitering detection
-- one worker for anomaly detection
-- the main process for CSV streaming, batching, progress logging, and memory logging
-
-Accepted rows are batched and sent to both workers.
 
 ## Notes
 
