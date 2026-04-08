@@ -37,7 +37,12 @@ Example files in this project:
 
 - [aisdk-2025-05-02.csv]
 - [aisdk-2025-05-03.csv]
-## Requirements
+- 
+## Task requirements
+
+Assignment requirements can be found in requirements.txt
+
+## Before runningmain code
 
 Use Python 3 and install these libraries:
 
