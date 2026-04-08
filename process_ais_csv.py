@@ -27,7 +27,7 @@ LOITERING_HOURS = timedelta(hours=2)
 GOING_DARK_HOURS = timedelta(hours=4)
 DRAUGHT_BLACKOUT_HOURS = timedelta(hours=2)
 PROGRESS_LOG_ROWS = 100000
-BATCH_SIZE = 40000
+BATCH_SIZE = 45000
 MEMORY_LOG_INTERVAL_SECONDS = 5.0
 MEMORY_PLOT_OUTPUT = "memory_usage_per_worker.png"
 TIMESTAMP_FORMAT = "%d/%m/%Y %H:%M:%S"
@@ -834,4 +834,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
